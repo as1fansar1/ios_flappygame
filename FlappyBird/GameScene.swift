@@ -1,4 +1,6 @@
 import SpriteKit
+import UIKit
+import CoreHaptics
 import GameplayKit
 
 struct HighScore: Codable {
@@ -27,6 +29,24 @@ class GameScene: SKScene, SKPhysicsContactDelegate {
     var nameInputLabel: SKLabelNode!
     var namePromptLabel: SKLabelNode!
     var gameSpeedMultiplier: CGFloat = 1.0
+    var soundEnabled: Bool = true
+    var hapticsEnabled: Bool = true
+    var pipeGapPadding: CGFloat = 100.0
+    let minPipeGapPadding: CGFloat = 40.0
+    var isGameStarted: Bool = false
+    var tapToStartLabel: SKLabelNode?
+    var spawnAction: SKAction!
+    let spawnActionKey = "spawnPipesLoop"
+    var startParticles: SKEmitterNode?
+    var creditsTopLabel: SKLabelNode?
+    var creditsBottomLabel: SKLabelNode?
+
+    // Haptic generators
+    private let impactFeedback = UIImpactFeedbackGenerator(style: .light)
+    private let selectionFeedback = UISelectionFeedbackGenerator()
+    private let notificationFeedback = UINotificationFeedbackGenerator()
+    private var hapticsEngine: CHHapticEngine?
+    private var supportsAdvancedHaptics: Bool = false
     
     let birdCategory: UInt32 = 1 << 0
     let worldCategory: UInt32 = 1 << 1
@@ -91,8 +111,7 @@ class GameScene: SKScene, SKPhysicsContactDelegate {
         let spawn = SKAction.run(spawnPipes)
         let delay = SKAction.wait(forDuration: TimeInterval(3.0))
         let spawnThenDelay = SKAction.sequence([spawn, delay])
-        let spawnThenDelayForever = SKAction.repeatForever(spawnThenDelay)
-        self.run(spawnThenDelayForever)
+        spawnAction = SKAction.repeatForever(spawnThenDelay)
         
         let birdTexture1 = SKTexture(imageNamed: "bird-01")
         birdTexture1.filteringMode = .nearest
@@ -104,11 +123,11 @@ class GameScene: SKScene, SKPhysicsContactDelegate {
         
         bird = SKSpriteNode(texture: birdTexture1)
         bird.setScale(1.5)
-        bird.position = CGPoint(x: self.frame.size.width * 0.35, y: self.frame.size.height * 0.6)
+        bird.position = CGPoint(x: self.frame.midX, y: self.frame.midY)
         bird.run(flap)
         
         bird.physicsBody = SKPhysicsBody(circleOfRadius: bird.size.height / 2.0)
-        bird.physicsBody?.isDynamic = true
+        bird.physicsBody?.isDynamic = false
         bird.physicsBody?.allowsRotation = false
         
         bird.physicsBody?.categoryBitMask = birdCategory
@@ -132,6 +151,27 @@ class GameScene: SKScene, SKPhysicsContactDelegate {
         self.addChild(scoreLabelNode)
         
         loadHighScores()
+
+        // Prepare haptic engines early for lower-latency feedback
+        impactFeedback.prepare()
+        selectionFeedback.prepare()
+        notificationFeedback.prepare()
+
+        // Setup Core Haptics for advanced/elongated haptics
+        supportsAdvancedHaptics = CHHapticEngine.capabilitiesForHardware().supportsHaptics
+        if supportsAdvancedHaptics {
+            do {
+                hapticsEngine = try CHHapticEngine()
+                try hapticsEngine?.start()
+            } catch {
+                supportsAdvancedHaptics = false
+            }
+        }
+
+        // Start in idle state
+        isGameStarted = false
+        moving.speed = 0
+        showTapToStart()
     }
     
     func spawnPipes() {
@@ -144,7 +184,7 @@ class GameScene: SKScene, SKPhysicsContactDelegate {
         
         let pipeDown = SKSpriteNode(texture: pipeTextureDown)
         pipeDown.setScale(1.5)
-        pipeDown.position = CGPoint(x: 0.0, y: y + Double(pipeDown.size.height) + 100.0)
+        pipeDown.position = CGPoint(x: 0.0, y: y + Double(pipeDown.size.height) + Double(pipeGapPadding))
         
         pipeDown.physicsBody = SKPhysicsBody(rectangleOf: pipeDown.size)
         pipeDown.physicsBody?.isDynamic = false
@@ -154,7 +194,7 @@ class GameScene: SKScene, SKPhysicsContactDelegate {
         
         let pipeUp = SKSpriteNode(texture: pipeTextureUp)
         pipeUp.setScale(1.5)
-        pipeUp.position = CGPoint(x: 0.0, y: y - 100.0)
+        pipeUp.position = CGPoint(x: 0.0, y: y - Double(pipeGapPadding))
         
         pipeUp.physicsBody = SKPhysicsBody(rectangleOf: pipeUp.size)
         pipeUp.physicsBody?.isDynamic = false
@@ -182,15 +222,27 @@ class GameScene: SKScene, SKPhysicsContactDelegate {
                 scoreLabelNode.text = String(score)
                 scoreLabelNode.run(SKAction.sequence([SKAction.scale(to: 1.5, duration: TimeInterval(0.1)), SKAction.scale(to: 1.0, duration: TimeInterval(0.1))]))
                 
-                // Increase speed every 8 points
-                if score % 8 == 0 {
+                // Haptic + sound on score
+                hapticSelection()
+                playSound("score.wav")
+                
+                // Increase speed every 3 points
+                if score % 3 == 0 {
                     increaseGameSpeed()
+                    impactFeedback.impactOccurred()
+                    impactFeedback.prepare()
+                    decreasePipeGap()
                 }
             } else {
                 moving.speed = 0
                 bird.physicsBody?.collisionBitMask = worldCategory
                 bird.run(SKAction.rotate(byAngle: CGFloat(Double.pi) * CGFloat(bird.physicsBody!.velocity.dy) * 0.00003, duration: 1), completion: { self.bird.speed = 0 })
                 
+                // Haptic + sound on hit/game over (elongated)
+                hapticNotify(.error)
+                hapticElongated(0.9)
+                playSound("hit.wav")
+
                 self.removeAction(forKey: "flash")
                 self.run(SKAction.sequence([SKAction.repeat(SKAction.sequence([SKAction.run({
                     self.backgroundColor = SKColor.red
@@ -198,6 +250,8 @@ class GameScene: SKScene, SKPhysicsContactDelegate {
                     self.backgroundColor = self.skyColor
                 }), SKAction.wait(forDuration: TimeInterval(0.05))]), count:4), SKAction.run({
                     if self.isHighScore(self.score) {
+                        self.hapticNotify(.success)
+                        self.playSound("highscore.wav")
                         self.promptForName()
                     } else {
                         self.showGameOver()
@@ -208,7 +262,7 @@ class GameScene: SKScene, SKPhysicsContactDelegate {
     }
     
     func resetScene() {
-        bird.position = CGPoint(x: self.frame.size.width / 2.5, y: self.frame.midY)
+        bird.position = CGPoint(x: self.frame.midX, y: self.frame.midY)
         bird.physicsBody?.velocity = CGVector(dx: 0, dy: 0)
         bird.physicsBody?.collisionBitMask = worldCategory | pipeCategory
         bird.speed = 1.0
@@ -217,7 +271,8 @@ class GameScene: SKScene, SKPhysicsContactDelegate {
         pipes.removeAllChildren()
         
         canRestart = false
-        moving.speed = 1
+        isGameStarted = false
+        moving.speed = 0
         score = 0
         scoreLabelNode.text = String(score)
         
@@ -227,11 +282,173 @@ class GameScene: SKScene, SKPhysicsContactDelegate {
         // Reset game speed
         gameSpeedMultiplier = 1.0
         moving.speed = gameSpeedMultiplier
+
+        // Reset pipe gap
+        pipeGapPadding = 100.0
+
+        // Stop spawning pipes
+        self.removeAction(forKey: spawnActionKey)
+
+        // Freeze bird until first tap
+        bird.physicsBody?.isDynamic = false
+        showTapToStart()
     }
     
     func increaseGameSpeed() {
         gameSpeedMultiplier *= 1.25 // Increase by 25%
         moving.speed = gameSpeedMultiplier
+    }
+
+    // MARK: - Haptics & Sound Helpers
+    func playSound(_ fileName: String) {
+        guard soundEnabled else { return }
+        run(SKAction.playSoundFileNamed(fileName, waitForCompletion: false))
+    }
+    
+    func hapticImpactLight() {
+        guard hapticsEnabled else { return }
+        impactFeedback.impactOccurred()
+        impactFeedback.prepare()
+    }
+    
+    func hapticSelection() {
+        guard hapticsEnabled else { return }
+        selectionFeedback.selectionChanged()
+        selectionFeedback.prepare()
+    }
+    
+    func hapticNotify(_ type: UINotificationFeedbackGenerator.FeedbackType) {
+        guard hapticsEnabled else { return }
+        notificationFeedback.notificationOccurred(type)
+        notificationFeedback.prepare()
+    }
+
+    func hapticElongated(_ duration: Double = 0.8) {
+        guard hapticsEnabled else { return }
+        if supportsAdvancedHaptics, let engine = hapticsEngine {
+            do {
+                let intensity = CHHapticEventParameter(parameterID: .hapticIntensity, value: 0.9)
+                let sharpness = CHHapticEventParameter(parameterID: .hapticSharpness, value: 0.4)
+                let event = CHHapticEvent(eventType: .hapticContinuous, parameters: [intensity, sharpness], relativeTime: 0, duration: duration)
+                let pattern = try CHHapticPattern(events: [event], parameters: [])
+                let player = try engine.makePlayer(with: pattern)
+                try engine.start()
+                try player.start(atTime: 0)
+            } catch {
+                // Fallback to a few impacts if Core Haptics fails
+                impactFeedback.impactOccurred(intensity: 1.0)
+                impactFeedback.prepare()
+            }
+        } else {
+            // Fallback for devices without Core Haptics
+            impactFeedback.impactOccurred(intensity: 1.0)
+            impactFeedback.prepare()
+        }
+    }
+
+    // MARK: - Difficulty Helpers
+    func decreasePipeGap() {
+        pipeGapPadding = max(minPipeGapPadding, pipeGapPadding - 10.0)
+    }
+
+    // MARK: - Start/Idle Helpers
+    func showTapToStart() {
+        tapToStartLabel?.removeFromParent()
+        let label = SKLabelNode(fontNamed: "MarkerFelt-Wide")
+        label.text = "Click here to start the game"
+        label.fontSize = 24
+        label.fontColor = SKColor.black
+        label.position = CGPoint(x: self.frame.midX, y: self.frame.midY - 80)
+        label.zPosition = 120
+        tapToStartLabel = label
+        self.addChild(label)
+        
+        // Pulse animation for the prompt
+        let pulseUp = SKAction.scale(to: 1.1, duration: 0.8)
+        let pulseDown = SKAction.scale(to: 1.0, duration: 0.8)
+        label.run(SKAction.repeatForever(SKAction.sequence([pulseUp, pulseDown])), withKey: "pulse")
+
+        // Show credit message in place of score while idle (two lines)
+        scoreLabelNode.isHidden = true
+        let baseY = scoreLabelNode.position.y
+        let top = SKLabelNode(fontNamed: "MarkerFelt-Wide")
+        top.text = "Made with <3"
+        top.fontSize = 18
+        top.fontColor = SKColor.white
+        top.position = CGPoint(x: self.frame.midX, y: baseY + 14)
+        top.zPosition = 120
+        self.addChild(top)
+        creditsTopLabel = top
+
+        let bottom = SKLabelNode(fontNamed: "MarkerFelt-Wide")
+        bottom.text = "by Asif Ansari"
+        bottom.fontSize = 18
+        bottom.fontColor = SKColor.white
+        bottom.position = CGPoint(x: self.frame.midX, y: baseY - 8)
+        bottom.zPosition = 120
+        self.addChild(bottom)
+        creditsBottomLabel = bottom
+
+        // Start background animations (particles and bird bobbing)
+        startIdleBackgroundAnimations()
+    }
+    
+    func hideTapToStart() {
+        tapToStartLabel?.removeFromParent()
+        tapToStartLabel = nil
+        startParticles?.removeFromParent()
+        startParticles = nil
+        bird.removeAction(forKey: "idleBobbing")
+        creditsTopLabel?.removeFromParent()
+        creditsTopLabel = nil
+        creditsBottomLabel?.removeFromParent()
+        creditsBottomLabel = nil
+        scoreLabelNode.isHidden = false
+    }
+    
+    func startGame() {
+        guard !isGameStarted else { return }
+        isGameStarted = true
+        hideTapToStart()
+        moving.speed = 1
+        bird.physicsBody?.isDynamic = true
+        scoreLabelNode.text = String(score)
+        self.run(spawnAction, withKey: spawnActionKey)
+    }
+
+    // MARK: - Start screen animations
+    func startIdleBackgroundAnimations() {
+        // Gentle bird bobbing
+        if bird.action(forKey: "idleBobbing") == nil {
+            let up = SKAction.moveBy(x: 0, y: 12, duration: 1.2)
+            let down = SKAction.moveBy(x: 0, y: -12, duration: 1.2)
+            let bob = SKAction.repeatForever(SKAction.sequence([up, down]))
+            bird.run(bob, withKey: "idleBobbing")
+        }
+        
+        // Soft floating particles behind gameplay elements
+        if startParticles == nil {
+            let emitter = SKEmitterNode()
+            emitter.particleBirthRate = 4
+            emitter.particleLifetime = 6
+            emitter.particleLifetimeRange = 2
+            emitter.particleSpeed = 20
+            emitter.particleSpeedRange = 10
+            emitter.particleAlpha = 0.25
+            emitter.particleAlphaRange = 0.15
+            emitter.particleAlphaSpeed = -0.03
+            emitter.particleScale = 0.5
+            emitter.particleScaleRange = 0.3
+            emitter.particleColor = .white
+            emitter.particlePosition = CGPoint(x: self.frame.midX, y: -10)
+            emitter.particlePositionRange = CGVector(dx: self.frame.width, dy: 0)
+            emitter.emissionAngle = .pi / 2
+            emitter.emissionAngleRange = .pi / 10
+            emitter.advanceSimulationTime(2)
+            emitter.zPosition = -15
+            self.addChild(emitter)
+            startParticles = emitter
+        }
     }
     
     // MARK: - Scoreboard Methods
@@ -368,7 +585,6 @@ class GameScene: SKScene, SKPhysicsContactDelegate {
         // Create virtual keyboard
         let letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
         let lettersPerRow = 9
-        let buttonSize: CGFloat = 30
         let spacing: CGFloat = 35
         
         for (index, letter) in letters.enumerated() {
@@ -436,10 +652,21 @@ class GameScene: SKScene, SKPhysicsContactDelegate {
         } else if isShowingScoreboard {
             hideScoreboard()
             canRestart = true
+        } else if !isGameStarted && !canRestart {
+            startGame()
+            for _ in touches {
+                bird.physicsBody?.velocity = CGVector(dx: 0, dy: 0)
+                bird.physicsBody?.applyImpulse(CGVector(dx: 0, dy: 50))
+                hapticImpactLight()
+                playSound("flap.wav")
+            }
         } else if moving.speed > 0 {
             for _ in touches {
                 bird.physicsBody?.velocity = CGVector(dx: 0, dy: 0)
                 bird.physicsBody?.applyImpulse(CGVector(dx: 0, dy: 50))
+                // Haptic + sound on flap
+                hapticImpactLight()
+                playSound("flap.wav")
             }
         } else if canRestart {
             self.resetScene()
